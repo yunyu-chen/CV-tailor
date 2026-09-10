@@ -31,6 +31,24 @@ python tailor_resume.py --resume resume.docx --jd jd.txt --dry-run
 
 Output defaults to `<resume>_tailored.docx` next to the input file.
 
+## Persistent instructions
+
+To give Claude standing behavior you want applied to every job you tailor for (tone,
+things to always avoid, a fixed way to phrase your summary line, etc.), create an
+`instructions.txt` file next to the script and write it in plain English — it's picked
+up automatically. Use a different file with `--instructions path/to/file.txt`. If the
+file doesn't exist, the tool just runs without extra instructions.
+
+## Reducing API cost across runs
+
+The system prompt (built-in instructions + your `instructions.txt`, if any) is sent
+with [prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+enabled. As long as that text doesn't change, the second and later calls you make
+within the ~5 minute cache window (e.g. tailoring your resume for several job postings
+back-to-back) are billed a small fraction of the normal input rate for that part of the
+prompt instead of full price. The cost line printed after each run shows how many
+tokens were served from cache.
+
 ## What it does
 
 1. Loads the job description (URL fetch, file, or raw text).

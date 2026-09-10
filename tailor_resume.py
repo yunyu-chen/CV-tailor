@@ -17,6 +17,7 @@ Flags:
     --review            Pause after keyword extraction so you can edit the list
     --dry-run           Show keywords + proposed edits, write nothing
     --max-change-pct N  Max allowed length change per paragraph before flagging (default 25)
+    --instructions PATH Text file of persistent instructions for Claude (default: instructions.txt)
 """
 
 import argparse
@@ -201,22 +202,28 @@ def call_claude(model: str, system: str, user: str, max_tokens: int = 2000):
     if not api_key:
         sys.exit("Set ANTHROPIC_API_KEY in your environment first.")
 
-    resp = requests.post(
-        API_URL,
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": ANTHROPIC_VERSION,
-            "content-type": "application/json",
-        },
-        json={
-            "model": model,
-            "max_tokens": max_tokens,
-            "system": system,
-            "messages": [{"role": "user", "content": user}],
-        },
-        timeout=60,
-    )
-    resp.raise_for_status()
+    try:
+        resp = requests.post(
+            API_URL,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": ANTHROPIC_VERSION,
+                "content-type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": max_tokens,
+                # Cached so repeated runs (e.g. tailoring for several jobs in one
+                # sitting) only pay full price for the system prompt once.
+                "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                "messages": [{"role": "user", "content": user}],
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        sys.exit(f"Claude API call failed: {e}")
+
     data = resp.json()
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     usage = data.get("usage", {"input_tokens": 0, "output_tokens": 0})
@@ -231,7 +238,13 @@ def parse_json_strict(text: str, what: str):
         sys.exit(f"Model did not return valid JSON for {what}. Raw output:\n{text}")
 
 
-def extract_keywords(jd_text: str, model: str):
+def with_custom_instructions(system: str, custom_instructions: str) -> str:
+    if not custom_instructions:
+        return system
+    return system + "\n\nAlso follow these persistent instructions from the user:\n" + custom_instructions
+
+
+def extract_keywords(jd_text: str, model: str, custom_instructions: str = ""):
     system = (
         "You extract ATS-relevant keywords from a job description. "
         "Respond with ONLY a JSON object, no prose, no markdown fences, no preamble. "
@@ -239,11 +252,12 @@ def extract_keywords(jd_text: str, model: str):
         "Keep each list to at most 15 concise items (skills, tools, certifications, "
         "domain terms) — not full sentences."
     )
+    system = with_custom_instructions(system, custom_instructions)
     text, usage = call_claude(model, system, jd_text, max_tokens=800)
     return parse_json_strict(text, "keyword extraction"), usage
 
 
-def rewrite_paragraphs(paragraphs, keywords: dict, jd_text: str, model: str):
+def rewrite_paragraphs(paragraphs, keywords: dict, jd_text: str, model: str, custom_instructions: str = ""):
     system = (
         "You tailor resume text to a job description without changing its factual claims, "
         "job titles, dates, employers, or overall length by more than roughly 15%. "
@@ -257,6 +271,7 @@ def rewrite_paragraphs(paragraphs, keywords: dict, jd_text: str, model: str):
         "Respond with ONLY a JSON object mapping paragraph id (as a string) to the new text, "
         'e.g. {"4": "new text", "7": "new text"}. No prose, no markdown fences, no commentary.'
     )
+    system = with_custom_instructions(system, custom_instructions)
     user = json.dumps(
         {
             "job_description": jd_text[:6000],
@@ -273,11 +288,20 @@ def rewrite_paragraphs(paragraphs, keywords: dict, jd_text: str, model: str):
 # --------------------------------------------------------------------------
 
 def estimate_cost(model: str, usages: list):
+    # Cache writes cost 1.25x the normal input rate, cache reads 0.1x — same ratios
+    # Anthropic applies to every model, so no separate rate table is needed here.
     in_rate, out_rate = RATES.get(model, RATES[DEFAULT_MODEL])
     total_in = sum(u.get("input_tokens", 0) for u in usages)
     total_out = sum(u.get("output_tokens", 0) for u in usages)
-    cost = (total_in / 1_000_000) * in_rate + (total_out / 1_000_000) * out_rate
-    return cost, total_in, total_out
+    cache_write = sum(u.get("cache_creation_input_tokens", 0) for u in usages)
+    cache_read = sum(u.get("cache_read_input_tokens", 0) for u in usages)
+    cost = (
+        (total_in / 1_000_000) * in_rate
+        + (total_out / 1_000_000) * out_rate
+        + (cache_write / 1_000_000) * in_rate * 1.25
+        + (cache_read / 1_000_000) * in_rate * 0.1
+    )
+    return cost, total_in, total_out, cache_read
 
 
 # --------------------------------------------------------------------------
@@ -293,16 +317,28 @@ def main():
     ap.add_argument("--review", action="store_true", help="Edit keyword list before rewriting")
     ap.add_argument("--dry-run", action="store_true", help="Show plan, write nothing")
     ap.add_argument("--max-change-pct", type=int, default=25)
+    ap.add_argument(
+        "--instructions",
+        type=Path,
+        default=Path("instructions.txt"),
+        help="Text file of persistent instructions for Claude (tone, style, things to "
+        "always/never do). Reused as-is across job submissions, so it's cheap to keep "
+        "loading it — see README. Default: instructions.txt (skipped if missing).",
+    )
     args = ap.parse_args()
 
     if not args.resume.exists():
         sys.exit(f"Resume not found: {args.resume}")
     out_path = args.out or args.resume.with_name(args.resume.stem + "_tailored.docx")
 
+    custom_instructions = ""
+    if args.instructions.exists():
+        custom_instructions = args.instructions.read_text(encoding="utf-8").strip()
+
     jd_text = load_jd(args.jd)
     paragraphs = get_editable_paragraphs(args.resume)
 
-    keywords, usage1 = extract_keywords(jd_text, args.model)
+    keywords, usage1 = extract_keywords(jd_text, args.model, custom_instructions)
 
     if args.review:
         print("\nMust-have:", ", ".join(keywords.get("must_have", [])))
@@ -311,20 +347,21 @@ def main():
         if edit:
             keywords["must_have"] = [k.strip() for k in edit.split(",") if k.strip()]
 
-    edits, usage2 = rewrite_paragraphs(paragraphs, keywords, jd_text, args.model)
+    edits, usage2 = rewrite_paragraphs(paragraphs, keywords, jd_text, args.model, custom_instructions)
 
-    cost, total_in, total_out = estimate_cost(args.model, [usage1, usage2])
+    cost, total_in, total_out, cache_read = estimate_cost(args.model, [usage1, usage2])
+    cache_note = f" ({cache_read} cached)" if cache_read else ""
 
     if args.dry_run:
         print(f"\n[dry-run] {len(edits)} paragraph(s) would change:")
         for pid, new_text in edits.items():
             print(f"  [{pid}] {new_text[:100]}")
-        print(f"\nEst. cost: ${cost:.4f} ({total_in} in / {total_out} out tokens)")
+        print(f"\nEst. cost: ${cost:.4f} ({total_in} in{cache_note} / {total_out} out tokens)")
         return
 
     flagged = edit_docx(args.resume, edits, out_path, args.max_change_pct)
 
-    print(f"✓ Saved {out_path} | {len(edits)} paragraph(s) updated | Est. cost: ${cost:.4f}")
+    print(f"✓ Saved {out_path} | {len(edits)} paragraph(s) updated | Est. cost: ${cost:.4f}{cache_note}")
     if flagged:
         print(f"⚠ {len(flagged)} paragraph(s) changed length by >{args.max_change_pct}% — review layout:")
         for pid, old, new, pct in flagged:
