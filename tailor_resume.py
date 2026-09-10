@@ -18,6 +18,7 @@ Flags:
     --dry-run           Show keywords + proposed edits, write nothing
     --max-change-pct N  Max allowed length change per paragraph before flagging (default 25)
     --instructions PATH Text file of persistent instructions for Claude (default: instructions.txt)
+    --masterfile PATH   Markdown file of your fuller work history for Claude to draw on (default: masterfile.md)
     --apply-edits PATH  Skip the API and apply a saved edits JSON file to --resume, writing --out
 """
 
@@ -271,7 +272,15 @@ def extract_keywords(jd_text: str, model: str, custom_instructions: str = ""):
     return parse_json_strict(text, "keyword extraction", stop_reason), usage
 
 
-def rewrite_paragraphs(paragraphs, keywords: dict, jd_text: str, model: str, custom_instructions: str = "", dump_path: Path = None):
+def rewrite_paragraphs(
+    paragraphs,
+    keywords: dict,
+    jd_text: str,
+    model: str,
+    custom_instructions: str = "",
+    masterfile_text: str = "",
+    dump_path: Path = None,
+):
     system = (
         "You tailor resume text to a job description without changing its factual claims, "
         "job titles, dates, employers, or overall length by more than roughly 15%. "
@@ -285,6 +294,16 @@ def rewrite_paragraphs(paragraphs, keywords: dict, jd_text: str, model: str, cus
         "Respond with ONLY a JSON object mapping paragraph id (as a string) to the new text, "
         'e.g. {"4": "new text", "7": "new text"}. No prose, no markdown fences, no commentary.'
     )
+    if masterfile_text:
+        system += (
+            "\n\nYou are also given the candidate's fuller personal work record below (their "
+            "masterfile) — richer than the resume itself. Use it only to pull a more specific, "
+            "truthful detail (a metric, tool, or outcome) into a paragraph you are already "
+            "rewriting, when it's a better fit for that paragraph's original topic than what's "
+            "there now. Never use it to add a fact unconnected to that paragraph's topic, invent "
+            "an achievement, or change an employer, title, or date.\n\n"
+            "=== MASTERFILE ===\n" + masterfile_text
+        )
     system = with_custom_instructions(system, custom_instructions)
     user = json.dumps(
         {
@@ -347,6 +366,15 @@ def main():
         "always/never do). Reused as-is across job submissions, so it's cheap to keep "
         "loading it — see README. Default: instructions.txt (skipped if missing).",
     )
+    ap.add_argument(
+        "--masterfile",
+        type=Path,
+        default=Path("masterfile.md"),
+        help="Markdown file of your fuller work history/experience, beyond what's in the "
+        "resume itself — Claude can pull specific details from it into a bullet it's "
+        "already rewriting. Reused as-is across job submissions — see README for how "
+        "this stays cheap. Default: masterfile.md (skipped if missing).",
+    )
     args = ap.parse_args()
 
     if not args.resume.exists():
@@ -372,6 +400,10 @@ def main():
     if args.instructions.exists():
         custom_instructions = args.instructions.read_text(encoding="utf-8").strip()
 
+    masterfile_text = ""
+    if args.masterfile.exists():
+        masterfile_text = args.masterfile.read_text(encoding="utf-8").strip()
+
     jd_text = load_jd(args.jd)
     paragraphs = get_editable_paragraphs(args.resume)
 
@@ -386,7 +418,7 @@ def main():
 
     raw_dump_path = out_path.parent / (out_path.stem + "_rewrite_raw.txt")
     edits, usage2 = rewrite_paragraphs(
-        paragraphs, keywords, jd_text, args.model, custom_instructions, dump_path=raw_dump_path
+        paragraphs, keywords, jd_text, args.model, custom_instructions, masterfile_text, dump_path=raw_dump_path
     )
 
     # Saved regardless of --dry-run so a paid-for rewrite is never lost — reapply anytime

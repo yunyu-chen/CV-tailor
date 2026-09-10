@@ -39,15 +39,36 @@ things to always avoid, a fixed way to phrase your summary line, etc.), create a
 up automatically. Use a different file with `--instructions path/to/file.txt`. If the
 file doesn't exist, the tool just runs without extra instructions.
 
+## Masterfile — give Claude your full work history, not just the resume
+
+A resume is a cut-down summary; you often have more relevant detail (extra metrics,
+side projects, tools you've used) than what's on the page. Create a `masterfile.md`
+next to the script — free-form Markdown, write it however's natural for you — and
+it's picked up automatically. Use a different file with `--masterfile path/to/file.md`.
+
+When rewriting a bullet, Claude can pull a more specific, truthful detail from the
+masterfile into it if it fits that bullet's original topic better. It won't add new
+bullets/sections (the tool only edits existing paragraphs in place — see "What it
+does" below) and it's told not to use the masterfile to introduce facts unconnected to
+the paragraph it's editing, or to change an employer/title/date. If the file doesn't
+exist, the tool just runs without it.
+
 ## Reducing API cost across runs
 
-The system prompt (built-in instructions + your `instructions.txt`, if any) is sent
-with [prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-enabled. As long as that text doesn't change, the second and later calls you make
-within the ~5 minute cache window (e.g. tailoring your resume for several job postings
-back-to-back) are billed a small fraction of the normal input rate for that part of the
-prompt instead of full price. The cost line printed after each run shows how many
-tokens were served from cache.
+The system prompt (built-in instructions + your `instructions.txt` + your
+`masterfile.md`, if any) is sent with
+[prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+enabled. As long as that combined text doesn't change, the second and later calls you
+make within the ~5 minute cache window (e.g. tailoring your resume for several job
+postings back-to-back) are billed a small fraction of the normal input rate for that
+part of the prompt instead of full price. The cost line printed after each run shows
+how many tokens were served from cache.
+
+A `masterfile.md` is usually your biggest chunk of static input, so it's worth keeping
+it lean — plain facts and bullet points read just as well as prose and cost fewer
+tokens. Note caching only helps *within* that ~5 minute window (e.g. running the tool
+for several jobs in one sitting); a masterfile still costs full price on the first
+call of a new session, same as before adding it.
 
 ## What it does
 
