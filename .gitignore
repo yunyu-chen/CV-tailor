@@ -9,4 +9,4 @@ instructions.txt
 *_rewrite_raw.txt
 *.docx
 *.json
-.lock*
+.~lock*
