@@ -8,3 +8,5 @@ instructions.txt
 *_edits.json
 *_rewrite_raw.txt
 *.docx
+*.json
+.lock*
