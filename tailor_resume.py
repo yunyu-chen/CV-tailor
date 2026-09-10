@@ -199,7 +199,7 @@ def get_editable_paragraphs(resume_path: Path):
 # Claude API calls — strict JSON-only, no commentary
 # --------------------------------------------------------------------------
 
-def call_claude(model: str, system: str, user: str, max_tokens: int = 2000):
+def call_claude(model: str, system: str, user: str, max_tokens: int = 2000, timeout: int = 60):
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         sys.exit("Set ANTHROPIC_API_KEY in your environment first.")
@@ -220,7 +220,7 @@ def call_claude(model: str, system: str, user: str, max_tokens: int = 2000):
                 "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                 "messages": [{"role": "user", "content": user}],
             },
-            timeout=60,
+            timeout=timeout,
         )
         resp.raise_for_status()
     except requests.RequestException as e:
@@ -312,7 +312,7 @@ def rewrite_paragraphs(
             "resume_paragraphs": paragraphs,
         }
     )
-    text, usage, stop_reason = call_claude(model, system, user, max_tokens=4096)
+    text, usage, stop_reason = call_claude(model, system, user, max_tokens=8192, timeout=120)
     return parse_json_strict(text, "paragraph rewrite", stop_reason, dump_path), usage
 
 
