@@ -62,6 +62,24 @@ tokens were served from cache.
    re-rendering — your fonts, colors, spacing, and tables are untouched.
 5. Prints one summary line with an estimated API cost, computed from actual token
    usage returned by the API.
+6. Saves the edits Claude returned to `<out>_edits.json`, so the API call is never
+   wasted even if you want to re-apply it later.
+
+## Re-applying edits without calling the API
+
+Every normal run saves the paragraph edits it got back from Claude to
+`<out>_edits.json` before writing the `.docx`. If you ever want to apply that same
+JSON to the resume again (e.g. after tweaking `--max-change-pct`, or recovering from
+a failed run), skip the API entirely:
+
+```bash
+python tailor_resume.py --resume resume.docx --apply-edits tailored_edits.json --out tailored.docx
+```
+
+This reads the JSON and edits the Word document directly — you never need to hand-edit
+the JSON yourself. If Claude's raw response ever fails to parse as JSON, it's saved to
+`<out>_rewrite_raw.txt` instead so nothing is lost; that's the one case where you'd
+need to fix the text by hand before it can be applied.
 
 ## Known limitations
 

@@ -18,6 +18,7 @@ Flags:
     --dry-run           Show keywords + proposed edits, write nothing
     --max-change-pct N  Max allowed length change per paragraph before flagging (default 25)
     --instructions PATH Text file of persistent instructions for Claude (default: instructions.txt)
+    --apply-edits PATH  Skip the API and apply a saved edits JSON file to --resume, writing --out
 """
 
 import argparse
@@ -227,15 +228,28 @@ def call_claude(model: str, system: str, user: str, max_tokens: int = 2000):
     data = resp.json()
     text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
     usage = data.get("usage", {"input_tokens": 0, "output_tokens": 0})
-    return text, usage
+    return text, usage, data.get("stop_reason")
 
 
-def parse_json_strict(text: str, what: str):
+def parse_json_strict(text: str, what: str, stop_reason: str = None, dump_path: Path = None):
     cleaned = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        sys.exit(f"Model did not return valid JSON for {what}. Raw output:\n{text}")
+        if dump_path:
+            dump_path.write_text(text, encoding="utf-8")
+        if stop_reason == "max_tokens":
+            sys.exit(
+                f"Claude's response for {what} was cut off before finishing (hit the output "
+                f"token limit) — try a shorter job description, a shorter resume, or raise "
+                f"max_tokens for that call in the script."
+                + (f" Raw (truncated) output saved to {dump_path}." if dump_path else "")
+            )
+        sys.exit(
+            f"Model did not return valid JSON for {what}."
+            + (f" Raw output saved to {dump_path} — fix it by hand, then rerun with "
+               f"--apply-edits {dump_path}." if dump_path else f" Raw output:\n{text}")
+        )
 
 
 def with_custom_instructions(system: str, custom_instructions: str) -> str:
@@ -253,11 +267,11 @@ def extract_keywords(jd_text: str, model: str, custom_instructions: str = ""):
         "domain terms) — not full sentences."
     )
     system = with_custom_instructions(system, custom_instructions)
-    text, usage = call_claude(model, system, jd_text, max_tokens=800)
-    return parse_json_strict(text, "keyword extraction"), usage
+    text, usage, stop_reason = call_claude(model, system, jd_text, max_tokens=800)
+    return parse_json_strict(text, "keyword extraction", stop_reason), usage
 
 
-def rewrite_paragraphs(paragraphs, keywords: dict, jd_text: str, model: str, custom_instructions: str = ""):
+def rewrite_paragraphs(paragraphs, keywords: dict, jd_text: str, model: str, custom_instructions: str = "", dump_path: Path = None):
     system = (
         "You tailor resume text to a job description without changing its factual claims, "
         "job titles, dates, employers, or overall length by more than roughly 15%. "
@@ -279,8 +293,8 @@ def rewrite_paragraphs(paragraphs, keywords: dict, jd_text: str, model: str, cus
             "resume_paragraphs": paragraphs,
         }
     )
-    text, usage = call_claude(model, system, user, max_tokens=3000)
-    return parse_json_strict(text, "paragraph rewrite"), usage
+    text, usage, stop_reason = call_claude(model, system, user, max_tokens=4096)
+    return parse_json_strict(text, "paragraph rewrite", stop_reason, dump_path), usage
 
 
 # --------------------------------------------------------------------------
@@ -311,8 +325,16 @@ def estimate_cost(model: str, usages: list):
 def main():
     ap = argparse.ArgumentParser(description="Tailor a .docx resume to a job description.")
     ap.add_argument("--resume", required=True, type=Path)
-    ap.add_argument("--jd", required=True)
+    ap.add_argument("--jd", help="Required unless --apply-edits is given")
     ap.add_argument("--out", type=Path)
+    ap.add_argument(
+        "--apply-edits",
+        type=Path,
+        help="Skip the API entirely and apply a JSON file of {paragraph_id: new_text} "
+        "edits straight to --resume, writing --out. Use this to retry applying edits "
+        "you already paid for — e.g. the *_edits.json saved after a normal run, or a "
+        "*_rewrite_raw.txt you fixed by hand.",
+    )
     ap.add_argument("--model", default=DEFAULT_MODEL, choices=list(RATES.keys()))
     ap.add_argument("--review", action="store_true", help="Edit keyword list before rewriting")
     ap.add_argument("--dry-run", action="store_true", help="Show plan, write nothing")
@@ -331,6 +353,21 @@ def main():
         sys.exit(f"Resume not found: {args.resume}")
     out_path = args.out or args.resume.with_name(args.resume.stem + "_tailored.docx")
 
+    if args.apply_edits:
+        if not args.apply_edits.exists():
+            sys.exit(f"Edits file not found: {args.apply_edits}")
+        edits = json.loads(args.apply_edits.read_text(encoding="utf-8"))
+        flagged = edit_docx(args.resume, edits, out_path, args.max_change_pct)
+        print(f"✓ Saved {out_path} | {len(edits)} paragraph(s) updated from {args.apply_edits}")
+        if flagged:
+            print(f"⚠ {len(flagged)} paragraph(s) changed length by >{args.max_change_pct}% — review layout:")
+            for pid, old, new, pct in flagged:
+                print(f"  [{pid}] {pct:.0f}% change")
+        return
+
+    if not args.jd:
+        sys.exit("--jd is required unless --apply-edits is given")
+
     custom_instructions = ""
     if args.instructions.exists():
         custom_instructions = args.instructions.read_text(encoding="utf-8").strip()
@@ -347,7 +384,15 @@ def main():
         if edit:
             keywords["must_have"] = [k.strip() for k in edit.split(",") if k.strip()]
 
-    edits, usage2 = rewrite_paragraphs(paragraphs, keywords, jd_text, args.model, custom_instructions)
+    raw_dump_path = out_path.parent / (out_path.stem + "_rewrite_raw.txt")
+    edits, usage2 = rewrite_paragraphs(
+        paragraphs, keywords, jd_text, args.model, custom_instructions, dump_path=raw_dump_path
+    )
+
+    # Saved regardless of --dry-run so a paid-for rewrite is never lost — reapply anytime
+    # with --apply-edits, no API call needed.
+    edits_path = out_path.parent / (out_path.stem + "_edits.json")
+    edits_path.write_text(json.dumps(edits, indent=2), encoding="utf-8")
 
     cost, total_in, total_out, cache_read = estimate_cost(args.model, [usage1, usage2])
     cache_note = f" ({cache_read} cached)" if cache_read else ""
@@ -357,6 +402,7 @@ def main():
         for pid, new_text in edits.items():
             print(f"  [{pid}] {new_text[:100]}")
         print(f"\nEst. cost: ${cost:.4f} ({total_in} in{cache_note} / {total_out} out tokens)")
+        print(f"Edits saved to {edits_path} (apply later with --apply-edits {edits_path})")
         return
 
     flagged = edit_docx(args.resume, edits, out_path, args.max_change_pct)
